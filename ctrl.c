@@ -9,9 +9,7 @@
 #include <fcntl.h>
 #include "frozen.h"
 #include "video.h"
-#include "screen.h"
 #include "edid.h"
-#include "lvgl/lvgl.h"
 
 typedef struct
 {
@@ -132,132 +130,6 @@ const char *bytes_to_hex(const uint8_t *bytes, size_t len)
     return hex_str;
 }
 
-void handle_lvgl_call(const int seq, const char *method, const char *json, size_t json_len)
-{
-    lv_obj_t *obj = NULL;
-    char *obj_name = NULL;
-
-    if (strcmp(method, "lv_disp_set_rotation") == 0)
-    {
-        char *rotation = NULL;
-        if (json_scanf(json, json_len, "{params: {rotation: %Q}}", &rotation) > 0)
-        {
-            lv_disp_rot_t rot;
-            if (strcmp(rotation, "90") == 0)
-            {
-                rot = LV_DISP_ROT_90;
-            }
-            else if (strcmp(rotation, "270") == 0)
-            {
-                rot = LV_DISP_ROT_270;
-            }
-            else
-            {
-                rot = -1;
-            }
-            free(rotation);
-            if (rot != -1)
-            {
-                lv_disp_set_rotation(NULL, rot);
-                write_json(ctrl_client_fd, "{seq: %d}", seq);
-            }
-            else
-            {
-                write_json_error(ctrl_client_fd, seq, "illegal rotation value");
-            }
-        }
-        else
-        {
-            write_json_error(ctrl_client_fd, seq, "missing rotation parameter");
-        }
-    }
-    else if (json_scanf(json, json_len, "{params: {obj: %Q}}", &obj_name) > 0)
-    {
-        obj = ui_get_obj(obj_name);
-        free(obj_name);
-
-        if (obj == NULL)
-        {
-            write_json_error(ctrl_client_fd, seq, "object not found");
-            return;
-        }
-
-        if (strcmp(method, "lv_scr_load") == 0)
-        {
-            if (lv_scr_act() != obj)
-            {
-                lv_scr_load(obj);
-            }
-            write_json(ctrl_client_fd, "{seq: %d}", seq);
-        }
-        else if (strcmp(method, "lv_label_set_text") == 0)
-        {
-            char *text = NULL;
-            if (json_scanf(json, json_len, "{params: {text: %Q}}", &text) > 0)
-            {
-                lv_label_set_text(obj, text);
-                free(text);
-                write_json(ctrl_client_fd, "{seq: %d}", seq);
-            }
-            else
-            {
-                write_json_error(ctrl_client_fd, seq, "missing text parameter");
-            }
-        }
-        else if (strcmp(method, "lv_img_set_src") == 0)
-        {
-            char *src = NULL;
-            if (json_scanf(json, json_len, "{params: {src: %Q}}", &src) > 0)
-            {
-                lv_img_dsc_t *img = ui_get_image(src);
-                free(src);
-                if (img != NULL)
-                {
-                    lv_img_set_src(obj, img);
-                    write_json(ctrl_client_fd, "{seq: %d}", seq);
-                }
-                else
-                {
-                    write_json_error(ctrl_client_fd, seq, "image source not found");
-                }
-            }
-            else
-            {
-                write_json_error(ctrl_client_fd, seq, "missing src parameter");
-            }
-        }
-        else if (strcmp(method, "lv_obj_set_state") == 0)
-        {
-            char *state = NULL;
-            if (json_scanf(json, json_len, "{params: {state: %Q}}", &state) > 0)
-            {
-                lv_obj_add_state(obj, LV_STATE_USER_1);
-                lv_state_t state_val = LV_STATE_DEFAULT;
-                if (strcmp(state, "LV_STATE_USER_1") == 0)
-                {
-                    state_val = LV_STATE_USER_1;
-                }
-                else if (strcmp(state, "LV_STATE_USER_2") == 0)
-                {
-                    state_val = LV_STATE_USER_2;
-                }
-                free(state);
-                lv_obj_clear_state(obj, LV_STATE_USER_1 | LV_STATE_USER_2);
-                lv_obj_add_state(obj, state_val);
-                write_json(ctrl_client_fd, "{seq: %d}", seq);
-            }
-            else
-            {
-                write_json_error(ctrl_client_fd, seq, "missing state parameter");
-            }
-        }
-    }
-    else
-    {
-        printf("handle_lvgl_call: No object name provided for method %s\n", method);
-    }
-}
-
 void *handle_client(void *arg)
 {
     const int BUF_SIZE = 1024;
@@ -302,26 +174,6 @@ void *handle_client(void *arg)
                     else
                     {
                         write_json_error(ctrl_client_fd, seq, "invalid quality factor");
-                    }
-                }
-                // if method starts with lv_, call the corresponding lvgl function
-                else if (strncmp("lv_", method, 3) == 0)
-                {
-                    handle_lvgl_call(seq, method, buf_in, n);
-                }
-                else if (strcmp("ui_set_text", method) == 0)
-                {
-                    char *name;
-                    char *text;
-                    if (json_scanf(buf_in, n, "{name: %Q, text: %Q}", &name, &text) > 0)
-                    {
-                        ui_set_text(name, text);
-                        free(name);
-                        free(text);
-                    }
-                    if (seq > 0)
-                    {
-                        write_json(ctrl_client_fd, "{seq: %d}", seq);
                     }
                 }
                 else if (strcmp("set_edid", method) == 0)

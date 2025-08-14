@@ -225,7 +225,7 @@ int socket_send_frame(const uint8_t *frame, ssize_t len)
 
 int video_init()
 {
-    if (connect_video_client("/var/run/jetkvm_video.sock") != 0)
+    if (connect_video_client("/var/run/kvm_video.sock") != 0)
     {
         printf("can not connect to video socket\n");
         return -1;

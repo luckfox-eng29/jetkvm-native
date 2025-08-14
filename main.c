@@ -9,7 +9,6 @@
 #include "rk_common.h"
 #include "ctrl.h"
 #include "video.h"
-#include "screen.h"
 
 #include <sys/ioctl.h>
 #include <linux/nbd.h>
@@ -28,6 +27,7 @@ void handle_signal(int signal)
     printf("Stopped control loop\n");
     video_shutdown();
     printf("Video system shut down\n");
+
 }
 
 int main(int argc, char **argv)
@@ -76,19 +76,13 @@ int main(int argc, char **argv)
         printf("TRANSMISSION_IOCTL_CLEAR_QUE: %d\n", NBD_CLEAR_QUE);
         return 0;
     }
-
-    init_lvgl();
-
-    if (connect_ctrl_client("/var/run/jetkvm_ctrl.sock") != 0)
+ 
+    if (connect_ctrl_client("/var/run/kvm_ctrl.sock") != 0)
     {
         printf("can not connect to ctrl server\n");
         return -1;
     }
     start_ctrl_loop();
-
-    printf("creating screen_thread\n");
-    pthread_t screen_thread;
-    pthread_create(&screen_thread, NULL, run_lvgl_loop, NULL);
 
     if (RK_MPI_SYS_Init() != RK_SUCCESS)
     {

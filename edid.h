@@ -30,6 +30,6 @@ int set_edid(uint8_t *edid, size_t size);
  *
  * @return const char* The status of the videocontroller
  */
-const char* videoc_log_status();
+const char *videoc_log_status();
 
 #endif // EDID_H
