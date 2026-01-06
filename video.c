@@ -28,7 +28,7 @@
 #include "yolo_c.h"
 #include "rk_mpi_rgn.h"
 #include "osd/overlay.h"
-#include "npu/preprocess.h"
+#include "preprocess.h"
 
 #define VIDEO_DEV "/dev/video0"
 #define SUB_DEV "/dev/v4l-subdev2"
@@ -62,6 +62,9 @@ static bool yolo_has_frame = false;
 static uint8_t* yolo_model_buf = NULL;
 static size_t yolo_model_buf_size = 0;
 static int yolo_model_h = 0, yolo_model_w = 0, yolo_model_c = 0;
+static int yolo_fd = -1;
+static void* yolo_va = NULL;
+static int yolo_bound_fd = -1;
 
 static const int YOLO_MAX_DETS = 128;
 
@@ -613,19 +616,16 @@ void *run_video_stream(void *arg)
             if (yolo_running) {
                 pthread_mutex_lock(&yolo_mutex);
                 if (!yolo_has_frame) {
-                    size_t need = (size_t)width * (size_t)height * 2;
-                    if (yolo_yuyv_size != need) {
-                        if (yolo_yuyv) free(yolo_yuyv);
-                        yolo_yuyv = (uint8_t*)malloc(need);
-                        yolo_yuyv_size = need;
-                    }
-                    void* pData = RK_MPI_MB_Handle2VirAddr(stFrame.stVFrame.pMbBlk);
-                    if (pData && yolo_yuyv) {
-                        memcpy(yolo_yuyv, pData, need);
-                        yolo_width = width;
-                        yolo_height = height;
-                        yolo_has_frame = true;
-                        pthread_cond_signal(&yolo_cond);
+                    if (yolo_model_w > 0 && yolo_model_h > 0) {
+                        int out_fd = -1; void* out_va = NULL;
+                        int r = yuyvfd_to_rgb_resized_fd(tmp_plane.m.fd, (int)width, (int)height, &out_fd, &out_va, yolo_model_w, yolo_model_h);
+                        if (r == 0 && out_fd >= 0 && out_va) {
+                            yolo_fd = out_fd;
+                            yolo_va = out_va;
+                            yolo_model_buf_size = (size_t)yolo_model_w * (size_t)yolo_model_h * (size_t)yolo_model_c;
+                            yolo_has_frame = true;
+                            pthread_cond_signal(&yolo_cond);
+                        }
                     }
                 }
                 pthread_mutex_unlock(&yolo_mutex);
@@ -890,27 +890,13 @@ static void* yolo_infer_thread(void* arg) {
             pthread_mutex_unlock(&yolo_mutex);
             break;
         }
-        int w = (int)yolo_width;
-        int h = (int)yolo_height;
-        size_t need_rgb = (size_t)w * (size_t)h * 3;
-        if (yolo_rgb_size != need_rgb) {
-            if (yolo_rgb) free(yolo_rgb);
-            yolo_rgb = (uint8_t*)malloc(need_rgb);
-            yolo_rgb_size = need_rgb;
-        }
-        const uint8_t* yuyv = yolo_yuyv;
         pthread_mutex_unlock(&yolo_mutex);
-        if (!yuyv || !yolo_rgb) continue;
-        RK_U64 t_rgb_s = get_us();
-        yuyv_to_rgb(yuyv, yolo_rgb, w, h);
-        RK_U64 t_rgb_e = get_us();
-        RK_U64 t_resize_s = get_us();
-        resize_rgb_nn(yolo_rgb, w, h, yolo_model_buf, yolo_model_w, yolo_model_h);
-        RK_U64 t_resize_e = get_us();
-        printf("yuyv_to_rgb %llu us, resize_rgb_nn %llu us\n",
-               (unsigned long long)(t_rgb_e - t_rgb_s),
-               (unsigned long long)(t_resize_e - t_resize_s));
-        if (yolo_copy_input(yolo_model_buf, yolo_model_buf_size) == 0) {
+        if (yolo_fd >= 0 && yolo_va) {
+            if (yolo_bound_fd != yolo_fd) {
+                if (yolo_bind_input_fd(yolo_fd, yolo_va, yolo_model_buf_size) == 0) {
+                    yolo_bound_fd = yolo_fd;
+                }
+            }
             yolo_det_t dets[YOLO_MAX_DETS];
             int count = yolo_run(dets, YOLO_MAX_DETS);
             //printf("yolov5 detections: %d\n", count);

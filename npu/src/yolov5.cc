@@ -172,13 +172,13 @@ int release_yolov5_model(rknn_app_context_t *app_ctx)
     for (int i = 0; i < app_ctx->io_num.n_input; i++) {
         if (app_ctx->input_mems[i] != NULL) {
             rknn_destroy_mem(app_ctx->rknn_ctx, app_ctx->input_mems[i]);
-            free(app_ctx->input_mems[i]);
+            app_ctx->input_mems[i] = NULL;
         }
     }
     for (int i = 0; i < app_ctx->io_num.n_output; i++) {
         if (app_ctx->output_mems[i] != NULL) {
             rknn_destroy_mem(app_ctx->rknn_ctx, app_ctx->output_mems[i]);
-            free(app_ctx->output_mems[i]);
+            app_ctx->output_mems[i] = NULL;
         }
     }
     return 0;

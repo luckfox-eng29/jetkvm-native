@@ -5,3 +5,6 @@
 [submodule "lv_drivers"]
 	path = lv_drivers
 	url = https://github.com/lvgl/lv_drivers.git
+[submodule "librga"]
+	path = librga
+	url = git@github.com:airockchip/librga.git

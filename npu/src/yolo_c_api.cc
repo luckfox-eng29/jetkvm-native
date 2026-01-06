@@ -2,6 +2,7 @@
 #include "postprocess.h"
 #include "yolo_c.h"
 #include <cstring>
+#include <cstdlib>
 
 static rknn_app_context_t g_ctx;
 static bool g_inited = false;
@@ -40,6 +41,23 @@ int yolo_copy_input(const uint8_t* data, size_t len) {
     memcpy(g_ctx.input_mems[0]->virt_addr, data, need);
     int ret = rknn_mem_sync(g_ctx.rknn_ctx, g_ctx.input_mems[0], RKNN_MEMORY_SYNC_TO_DEVICE);
     if (ret != RKNN_SUCC) return ret;
+    return 0;
+}
+
+int yolo_bind_input_fd(int fd, void* va, size_t size) {
+    if (!g_inited) return -1;
+    rknn_tensor_mem* old = g_ctx.input_mems[0];
+    rknn_tensor_mem* mem = rknn_create_mem_from_fd(g_ctx.rknn_ctx, fd, va, (uint32_t)size, 0);
+    if (!mem) return -2;
+    int ret = rknn_set_io_mem(g_ctx.rknn_ctx, mem, &g_ctx.input_attrs[0]);
+    if (ret < 0) {
+        rknn_destroy_mem(g_ctx.rknn_ctx, mem);
+        return ret;
+    }
+    g_ctx.input_mems[0] = mem;
+    if (old) {
+        rknn_destroy_mem(g_ctx.rknn_ctx, old);
+    }
     return 0;
 }
 
