@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -24,6 +25,10 @@
 #include <sys/socket.h>
 #include "video.h"
 #include "ctrl.h"
+#include "yolo_c.h"
+#include "rk_mpi_rgn.h"
+#include "osd/overlay.h"
+#include "npu/preprocess.h"
 
 #define VIDEO_DEV "/dev/video0"
 #define SUB_DEV "/dev/v4l-subdev2"
@@ -39,8 +44,27 @@ MB_POOL memPool = MB_INVALID_POOLID;
 
 bool should_exit = false;
 float quality_factor = 1.0f;
+RK_CODEC_ID_E encodec_type = RK_VIDEO_ID_AVC;
 
 static void *venc_read_stream(void *arg);
+static void* yolo_infer_thread(void* arg);
+
+static pthread_t* yolo_thread = NULL;
+static volatile bool yolo_running = false;
+static pthread_mutex_t yolo_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t yolo_cond = PTHREAD_COND_INITIALIZER;
+static uint8_t* yolo_yuyv = NULL;
+static size_t yolo_yuyv_size = 0;
+static uint8_t* yolo_rgb = NULL;
+static size_t yolo_rgb_size = 0;
+static uint32_t yolo_width = 0, yolo_height = 0;
+static bool yolo_has_frame = false;
+static uint8_t* yolo_model_buf = NULL;
+static size_t yolo_model_buf_size = 0;
+static int yolo_model_h = 0, yolo_model_w = 0, yolo_model_c = 0;
+
+static const int YOLO_MAX_DETS = 128;
+
 
 RK_U64 get_us()
 {
@@ -72,18 +96,29 @@ double calculate_bitrate(float bitrate_factor, int width, int height)
     return bitrate;
 }
 
-static void populate_venc_attr(VENC_CHN_ATTR_S *stAttr, RK_U32 bitrate, RK_U32 max_bitrate, RK_U32 width, RK_U32 height)
+static void populate_venc_attr(VENC_CHN_ATTR_S *stAttr, RK_CODEC_ID_E enType, RK_U32 bitrate, RK_U32 max_bitrate, RK_U32 width, RK_U32 height)
 {
     memset(stAttr, 0, sizeof(VENC_CHN_ATTR_S));
 
-    stAttr->stRcAttr.enRcMode = VENC_RC_MODE_H264VBR;
-    stAttr->stRcAttr.stH264Vbr.u32BitRate = bitrate;
-    stAttr->stRcAttr.stH264Vbr.u32MaxBitRate = max_bitrate;
-    stAttr->stRcAttr.stH264Vbr.u32Gop = 60;
 
-    stAttr->stVencAttr.enType = RK_VIDEO_ID_AVC;
+    if (enType == RK_VIDEO_ID_HEVC)
+    {
+        stAttr->stRcAttr.enRcMode = VENC_RC_MODE_H265VBR;
+        stAttr->stRcAttr.stH265Vbr.u32BitRate = bitrate;
+        stAttr->stRcAttr.stH265Vbr.u32MaxBitRate = max_bitrate;
+        stAttr->stRcAttr.stH265Vbr.u32Gop = 60;
+    }
+    else if (enType == RK_VIDEO_ID_AVC)
+    {
+        stAttr->stRcAttr.enRcMode = VENC_RC_MODE_H264VBR;
+        stAttr->stRcAttr.stH264Vbr.u32BitRate = bitrate;
+        stAttr->stRcAttr.stH264Vbr.u32MaxBitRate = max_bitrate;
+        stAttr->stRcAttr.stH264Vbr.u32Gop = 60;
+        stAttr->stVencAttr.u32Profile = H264E_PROFILE_MAIN;
+    }
+ 
+    stAttr->stVencAttr.enType = enType;
     stAttr->stVencAttr.enPixelFormat = RK_FMT_YUV422_YUYV;
-    stAttr->stVencAttr.u32Profile = H264E_PROFILE_HIGH;
     stAttr->stVencAttr.u32PicWidth = width;
     stAttr->stVencAttr.u32PicHeight = height;
     // stAttr->stVencAttr.u32VirWidth = (width + 15) & (~15);
@@ -97,11 +132,11 @@ static void populate_venc_attr(VENC_CHN_ATTR_S *stAttr, RK_U32 bitrate, RK_U32 m
 
 pthread_t *venc_read_thread = NULL;
 volatile bool venc_running = false;
-static int32_t venc_start(int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height)
+static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height)
 {
     int32_t ret;
     VENC_CHN_ATTR_S stAttr;
-    populate_venc_attr(&stAttr, bitrate, max_bitrate, width, height);
+    populate_venc_attr(&stAttr, enType, bitrate, max_bitrate, width, height);
 
     ret = RK_MPI_VENC_CreateChn(VENC_CHANNEL, &stAttr);
     if (ret < 0)
@@ -250,6 +285,12 @@ int video_init()
         return ret;
     }
     printf("buf_init completed successfully\n");
+
+    if (yolo_init("/userdata/picokvm/model/yolov5.rknn") != 0) {
+        printf("yolov5 init failed\n");
+        return -1;
+    }
+    yolo_input_shape(&yolo_model_h, &yolo_model_w, &yolo_model_c);
 
     format_thread = malloc(sizeof(pthread_t));
     pthread_create(format_thread, NULL, run_detect_format, NULL);
@@ -472,12 +513,15 @@ void *run_video_stream(void *arg)
 
         // Set VENC parameters
         int32_t bitrate = calculate_bitrate(quality_factor, width, height);
-        RK_S32 ret = venc_start(bitrate, bitrate * 2, width, height);
+        RK_CODEC_ID_E enType = encodec_type;
+        RK_S32 ret = venc_start(enType, bitrate, bitrate * 2, width, height);
         if (ret != RK_SUCCESS)
         {
-            RK_LOGE("Set VENC parameters failed with %#x", ret);
-            goto cleanup;
-        }
+        RK_LOGE("Set VENC parameters failed with %#x", ret);
+        goto cleanup;
+    }
+
+        overlay_init(width, height, VENC_CHANNEL);
 
         fd_set fds;
         struct timeval tv;
@@ -565,6 +609,27 @@ void *run_video_stream(void *arg)
 
             if (ioctl(video_dev_fd, VIDIOC_QBUF, &buf) < 0)
                 printf("failture VIDIOC_QBUF\n");
+
+            if (yolo_running) {
+                pthread_mutex_lock(&yolo_mutex);
+                if (!yolo_has_frame) {
+                    size_t need = (size_t)width * (size_t)height * 2;
+                    if (yolo_yuyv_size != need) {
+                        if (yolo_yuyv) free(yolo_yuyv);
+                        yolo_yuyv = (uint8_t*)malloc(need);
+                        yolo_yuyv_size = need;
+                    }
+                    void* pData = RK_MPI_MB_Handle2VirAddr(stFrame.stVFrame.pMbBlk);
+                    if (pData && yolo_yuyv) {
+                        memcpy(yolo_yuyv, pData, need);
+                        yolo_width = width;
+                        yolo_height = height;
+                        yolo_has_frame = true;
+                        pthread_cond_signal(&yolo_cond);
+                    }
+                }
+                pthread_mutex_unlock(&yolo_mutex);
+            }
         }
     cleanup:
         if (ioctl(video_dev_fd, VIDIOC_STREAMOFF, &type) < 0)
@@ -573,6 +638,7 @@ void *run_video_stream(void *arg)
         }
 
         venc_stop();
+        overlay_deinit(VENC_CHANNEL);
 
         for (int i = 0; i < input_buffer_count; i++)
         {
@@ -618,6 +684,10 @@ void video_shutdown()
         RK_MPI_MB_DestroyPool(memPool);
     }
     printf("Destroyed memory pool\n");
+    if (yolo_yuyv) { free(yolo_yuyv); yolo_yuyv = NULL; yolo_yuyv_size = 0; }
+    if (yolo_rgb) { free(yolo_rgb); yolo_rgb = NULL; yolo_rgb_size = 0; }
+    if (yolo_model_buf) { free(yolo_model_buf); yolo_model_buf = NULL; yolo_model_buf_size = 0; }
+    yolo_deinit();
     // if (format_thread != NULL) {
     //     pthread_join(*format_thread, NULL);
     //     free(format_thread);
@@ -650,6 +720,15 @@ void video_stop_streaming()
         free(streaming_thread);
         streaming_thread = NULL;
         printf("video streaming stopped\n");
+    }
+    if (yolo_thread != NULL) {
+        yolo_running = false;
+        pthread_mutex_lock(&yolo_mutex);
+        pthread_cond_signal(&yolo_cond);
+        pthread_mutex_unlock(&yolo_mutex);
+        pthread_join(*yolo_thread, NULL);
+        free(yolo_thread);
+        yolo_thread = NULL;
     }
 }
 
@@ -751,4 +830,100 @@ void video_set_quality_factor(float factor)
         video_stop_streaming();
         video_start_streaming();
     }
+}
+
+void video_set_encodec_type(RK_CODEC_ID_E type)
+{
+    encodec_type = type;
+
+    if (streaming_flag == true)
+    {
+        printf("restarting on going video streaming due to encodec type change\n");
+        video_stop_streaming();
+        video_start_streaming();
+    }
+}
+
+void video_set_yolo_enable(int enable)
+{
+    if (enable)
+    {
+        if (!yolo_running)
+        {
+            yolo_running = true;
+            if (yolo_thread == NULL)
+            {
+                yolo_thread = malloc(sizeof(pthread_t));
+                pthread_create(yolo_thread, NULL, yolo_infer_thread, NULL);
+            }
+        }
+    }
+    else
+    {
+        if (yolo_running)
+        {
+            yolo_running = false;
+            pthread_mutex_lock(&yolo_mutex);
+            pthread_cond_signal(&yolo_cond);
+            pthread_mutex_unlock(&yolo_mutex);
+            if (yolo_thread)
+            {
+                pthread_join(*yolo_thread, NULL);
+                free(yolo_thread);
+                yolo_thread = NULL;
+            }
+        }
+        overlay_draw_detections(yolo_model_w, yolo_model_h, NULL, 0, 0x00FF00FF);
+    }
+}
+static void* yolo_infer_thread(void* arg) {
+    yolo_input_shape(&yolo_model_h, &yolo_model_w, &yolo_model_c);
+    size_t expect = (size_t)yolo_model_h * (size_t)yolo_model_w * (size_t)yolo_model_c;
+    yolo_model_buf = (uint8_t*)malloc(expect);
+    yolo_model_buf_size = expect;
+    while (yolo_running) {
+        pthread_mutex_lock(&yolo_mutex);
+        while (!yolo_has_frame && yolo_running) {
+            pthread_cond_wait(&yolo_cond, &yolo_mutex);
+        }
+        if (!yolo_running) {
+            pthread_mutex_unlock(&yolo_mutex);
+            break;
+        }
+        int w = (int)yolo_width;
+        int h = (int)yolo_height;
+        size_t need_rgb = (size_t)w * (size_t)h * 3;
+        if (yolo_rgb_size != need_rgb) {
+            if (yolo_rgb) free(yolo_rgb);
+            yolo_rgb = (uint8_t*)malloc(need_rgb);
+            yolo_rgb_size = need_rgb;
+        }
+        const uint8_t* yuyv = yolo_yuyv;
+        pthread_mutex_unlock(&yolo_mutex);
+        if (!yuyv || !yolo_rgb) continue;
+        RK_U64 t_rgb_s = get_us();
+        yuyv_to_rgb(yuyv, yolo_rgb, w, h);
+        RK_U64 t_rgb_e = get_us();
+        RK_U64 t_resize_s = get_us();
+        resize_rgb_nn(yolo_rgb, w, h, yolo_model_buf, yolo_model_w, yolo_model_h);
+        RK_U64 t_resize_e = get_us();
+        printf("yuyv_to_rgb %llu us, resize_rgb_nn %llu us\n",
+               (unsigned long long)(t_rgb_e - t_rgb_s),
+               (unsigned long long)(t_resize_e - t_resize_s));
+        if (yolo_copy_input(yolo_model_buf, yolo_model_buf_size) == 0) {
+            yolo_det_t dets[YOLO_MAX_DETS];
+            int count = yolo_run(dets, YOLO_MAX_DETS);
+            //printf("yolov5 detections: %d\n", count);
+            int print_n = count < YOLO_MAX_DETS ? count : YOLO_MAX_DETS;
+            for (int i = 0; i < print_n; ++i) {
+                const char* name = yolo_cls_name(dets[i].cls_id);
+                //printf("det %d: %s %.2f [%d,%d,%d,%d]\n", i, name, dets[i].conf, dets[i].left, dets[i].top, dets[i].right, dets[i].bottom);
+            }
+            overlay_draw_detections(yolo_model_w, yolo_model_h, dets, print_n, 0x00FF00FF);
+        }
+        pthread_mutex_lock(&yolo_mutex);
+        yolo_has_frame = false;
+        pthread_mutex_unlock(&yolo_mutex);
+    }
+    return NULL;
 }

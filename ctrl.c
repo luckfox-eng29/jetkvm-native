@@ -176,6 +176,46 @@ void *handle_client(void *arg)
                         write_json_error(ctrl_client_fd, seq, "invalid quality factor");
                     }
                 }
+                else if (strcmp("set_video_encodec_type", method) == 0)
+                {
+                    RK_CODEC_ID_E encodec_type;
+                    char* encodec_type_str;
+                    if (json_scanf(buf_in, n, "{params: {encodec_type: %Q}}", &encodec_type_str) > 0)
+                    {
+                        if (strcmp(encodec_type_str, "avc") == 0)
+                        {
+                            encodec_type = RK_VIDEO_ID_AVC;
+                        }
+                        else if (strcmp(encodec_type_str, "hevc") == 0)
+                        {
+                            encodec_type = RK_VIDEO_ID_HEVC;
+                        }
+                        else
+                        {
+                            write_json_error(ctrl_client_fd, seq, "invalid encodec type");
+                            continue;
+                        }
+                        video_set_encodec_type(encodec_type);
+                        write_json(ctrl_client_fd, "{seq: %d}", seq);
+                    }
+                    else
+                    {
+                        write_json_error(ctrl_client_fd, seq, "invalid encodec type");
+                    }
+                }
+                else if (strcmp("set_yolo_enable", method) == 0)
+                {
+                    char enable_str[16];
+                    if (json_scanf(buf_in, n, "{params: {enable: %s}}", enable_str) > 0)
+                    {
+                        video_set_yolo_enable(strcmp(enable_str, "true") == 0);
+                        write_json(ctrl_client_fd, "{seq: %d}", seq);
+                    }
+                    else
+                    {
+                        write_json_error(ctrl_client_fd, seq, "invalid enable");
+                    }
+                }
                 else if (strcmp("set_edid", method) == 0)
                 {
                     uint8_t edid[256];
