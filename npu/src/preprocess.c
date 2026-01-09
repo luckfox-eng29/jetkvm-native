@@ -16,6 +16,11 @@ static int s_cma_disabled = 0;
 static int s_mid_fd = -1, s_mid_size = 0;
 static void* s_mid_va = NULL;
 
+// Separate buffers for preview to avoid conflict with YOLO
+static int s_preview_dst_fd = -1;
+static int s_preview_dst_size = 0;
+static void* s_preview_dst_va = NULL;
+
 static void yuyv_to_rgb_cpu(const uint8_t* yuyv, uint8_t* rgb, int width, int height) {
     int stride = width * 2;
     for (int y = 0; y < height; ++y) {
@@ -209,4 +214,60 @@ void resize_rgb_nn(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int
             dp[2] = sp[2];
         }
     }
+}
+
+int yuyvfd_to_rgb565_resized(int src_fd, int sw, int sh, uint8_t* dst_rgb, int dw, int dh) {
+    int w = (sw & ~1);
+    int h = sh;
+    int mid_size = dw * dh * 2;
+    int out_size = dw * dh * 2; // RGB565 is 2 bytes/pixel
+    if (s_mid_fd < 0 || s_mid_size != mid_size || s_mid_va == NULL) {
+        if (s_mid_fd >= 0) dma_buf_free((size_t)s_mid_size, &s_mid_fd, s_mid_va);
+        s_mid_fd = -1; s_mid_va = NULL; s_mid_size = mid_size;
+        if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, (size_t)s_mid_size, &s_mid_fd, &s_mid_va) != 0) {
+            s_mid_fd = -1; s_mid_va = NULL;
+        }
+    }
+    if (s_preview_dst_fd < 0 || s_preview_dst_size != out_size || s_preview_dst_va == NULL) {
+        if (s_preview_dst_fd >= 0) dma_buf_free((size_t)s_preview_dst_size, &s_preview_dst_fd, s_preview_dst_va);
+        s_preview_dst_fd = -1; s_preview_dst_va = NULL; s_preview_dst_size = out_size;
+        if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, (size_t)s_preview_dst_size, &s_preview_dst_fd, &s_preview_dst_va) != 0) {
+            s_preview_dst_fd = -1; s_preview_dst_va = NULL;
+        }
+    }
+    if (s_mid_fd < 0 || s_preview_dst_fd < 0 || s_mid_va == NULL || s_preview_dst_va == NULL) {
+        return -1;
+    }
+    rga_buffer_handle_t src_handle = importbuffer_fd(src_fd, &(im_handle_param_t){w, h, RK_FORMAT_YUYV_422});
+    rga_buffer_handle_t mid_handle = importbuffer_fd(s_mid_fd, &(im_handle_param_t){dw, dh, RK_FORMAT_YUYV_422});
+    rga_buffer_handle_t out_handle = importbuffer_fd(s_preview_dst_fd, &(im_handle_param_t){dw, dh, RK_FORMAT_BGR_565});
+    if (!src_handle || !mid_handle || !out_handle) {
+        if (src_handle) releasebuffer_handle(src_handle);
+        if (mid_handle) releasebuffer_handle(mid_handle);
+        if (out_handle) releasebuffer_handle(out_handle);
+        return -1;
+    }
+    rga_buffer_t src = wrapbuffer_handle(src_handle, w, h, RK_FORMAT_YUYV_422);
+    rga_buffer_t mid = wrapbuffer_handle(mid_handle, dw, dh, RK_FORMAT_YUYV_422);
+    rga_buffer_t out = wrapbuffer_handle(out_handle, dw, dh, RK_FORMAT_BGR_565);
+    IM_STATUS r1 = imresize(src, mid, 0, 0, IM_INTERP_DEFAULT, 1);
+    if (r1 != IM_STATUS_SUCCESS) {
+        releasebuffer_handle(src_handle);
+        releasebuffer_handle(mid_handle);
+        releasebuffer_handle(out_handle);
+        return -1;
+    }
+    IM_STATUS r2 = imcvtcolor(mid, out, RK_FORMAT_YUYV_422, RK_FORMAT_BGR_565, IM_YUV_TO_RGB_BT601_LIMIT, 1);
+    if (r2 != IM_STATUS_SUCCESS) {
+        releasebuffer_handle(src_handle);
+        releasebuffer_handle(mid_handle);
+        releasebuffer_handle(out_handle);
+        return -1;
+    }
+    dma_sync_device_to_cpu(s_preview_dst_fd);
+    memcpy(dst_rgb, s_preview_dst_va, (size_t)out_size);
+    releasebuffer_handle(src_handle);
+    releasebuffer_handle(mid_handle);
+    releasebuffer_handle(out_handle);
+    return 0;
 }

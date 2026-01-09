@@ -48,6 +48,7 @@ RK_CODEC_ID_E encodec_type = RK_VIDEO_ID_AVC;
 
 static void *venc_read_stream(void *arg);
 static void* yolo_infer_thread(void* arg);
+static void *run_preview_socket_thread(void *arg);
 
 static pthread_t* yolo_thread = NULL;
 static volatile bool yolo_running = false;
@@ -225,6 +226,9 @@ static int32_t buf_init()
 }
 
 pthread_t *format_thread = NULL;
+pthread_t *preview_thread = NULL;
+int preview_client_fd = -1;
+pthread_mutex_t preview_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int video_client_fd = 0;
 
@@ -297,6 +301,10 @@ int video_init()
 
     format_thread = malloc(sizeof(pthread_t));
     pthread_create(format_thread, NULL, run_detect_format, NULL);
+
+    preview_thread = malloc(sizeof(pthread_t));
+    pthread_create(preview_thread, NULL, run_preview_socket_thread, NULL);
+
     return RK_SUCCESS;
 }
 
@@ -382,6 +390,55 @@ uint32_t detected_width, detected_height;
 bool detected_signal = false, streaming_flag = false;
 
 pthread_t *streaming_thread = NULL;
+
+static void *run_preview_socket_thread(void *arg) {
+    int server_fd, client_fd;
+    struct sockaddr_un address;
+    const char *socket_path = "/var/run/kvm_preview.sock";
+
+    server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        perror("preview socket");
+        return NULL;
+    }
+
+    memset(&address, 0, sizeof(struct sockaddr_un));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, socket_path, sizeof(address.sun_path) - 1);
+    unlink(socket_path);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        perror("preview bind");
+        return NULL;
+    }
+
+    if (listen(server_fd, 5) == -1) {
+        perror("preview listen");
+        return NULL;
+    }
+
+    printf("Preview socket listening on %s\n", socket_path);
+
+    while (!should_exit) {
+        client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd == -1) {
+            if (should_exit) break;
+            perror("preview accept");
+            continue;
+        }
+
+        printf("Preview client connected\n");
+        pthread_mutex_lock(&preview_mutex);
+        if (preview_client_fd != -1) {
+            close(preview_client_fd);
+        }
+        preview_client_fd = client_fd;
+        pthread_mutex_unlock(&preview_mutex);
+    }
+    close(server_fd);
+    unlink(socket_path);
+    return NULL;
+}
 
 void write_buffer_to_file(const uint8_t *buffer, size_t length, const char *filename)
 {
@@ -564,6 +621,35 @@ void *run_video_stream(void *arg)
                 perror("VIDIOC_DQBUF failed");
                 break;
             }
+
+            pthread_mutex_lock(&preview_mutex);
+            if (preview_client_fd != -1) {
+                // Calculate proportional height to fit width 240
+                int preview_w = 240;
+                int preview_h = 240;
+                if (width > 0) {
+                    preview_h = (int)((float)height * preview_w / width);
+                    // Ensure height is even for YUV requirements
+                    preview_h = (preview_h + 1) & ~1;
+                    if (preview_h > 240) preview_h = 240; // Should not happen for 16:9
+                }
+
+                static uint8_t rgb_preview_buf[240 * 240 * 2];
+
+                uint16_t *ptr = (uint16_t *)rgb_preview_buf;
+                for (int i = 0; i < 240 * 240; i++) {
+                    ptr[i] = 0x0000;
+                }
+
+                int y_offset = (240 - preview_h) / 2;
+                uint8_t *dst_ptr = rgb_preview_buf + (y_offset * 240 * 2);
+
+                if (yuyvfd_to_rgb565_resized(tmp_plane.m.fd, width, height, dst_ptr, preview_w, preview_h) == 0) {
+                     send(preview_client_fd, rgb_preview_buf, sizeof(rgb_preview_buf), MSG_DONTWAIT);
+                }
+            }
+            pthread_mutex_unlock(&preview_mutex);
+
             // printf("got frame, bytesused = %d\n", tmp_plane.bytesused);
             memset(&stFrame, 0, sizeof(VIDEO_FRAME_INFO_S));
             MB_BLK blk = RK_NULL;
